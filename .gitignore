@@ -1,0 +1,29 @@
+﻿# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+
+# Environment
+.env
+.venv/
+venv/
+env/
+
+# DB / Store
+*.db
+.episodic_store.json
+
+# Claude AI files
+.claude/
+CLAUDE.md
+
+# Documentation (push separately later)
+docs/
+
+# Evaluation suite (push separately later)
+eval/
+
+# README (push separately later)
+README.md

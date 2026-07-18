@@ -1,0 +1,17 @@
+langgraph>=1.0
+langgraph-checkpoint-postgres>=2.0.0
+psycopg[binary,pool]>=3.1
+langchain-core
+pydantic>=2
+langsmith
+groq
+google-generativeai
+exa_py
+tavily-python
+pymupdf
+beautifulsoup4
+fastapi
+uvicorn
+qdrant-client
+python-dotenv
+httpx
