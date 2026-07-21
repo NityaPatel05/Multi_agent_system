@@ -1,0 +1,75 @@
+{
+  "adapters": [
+    {
+      "name": "mcp_search_adapter",
+      "kind": "domain_specific_adapter",
+      "capability": "search",
+      "tools": [
+        {
+          "name": "exa_search",
+          "role": "primary",
+          "requires_env": ["EXA_API_KEY"]
+        },
+        {
+          "name": "tavily_search",
+          "role": "fallback",
+          "requires_env": ["TAVILY_API_KEY"],
+          "fallback_for": "exa_search"
+        }
+      ],
+      "mock_mode": "deterministic offline mock when neither provider is configured"
+    },
+    {
+      "name": "mcp_extract_adapter",
+      "kind": "domain_specific_adapter",
+      "capability": "extract",
+      "tools": [
+        {
+          "name": "pdf_extract",
+          "role": "primary",
+          "backend": "pymupdf"
+        },
+        {
+          "name": "html_extract",
+          "role": "primary",
+          "backend": "beautifulsoup4"
+        },
+        {
+          "name": "raw_text_extract",
+          "role": "fallback",
+          "fallback_for": ["pdf_extract", "html_extract"]
+        }
+      ],
+      "mock_mode": "deterministic offline mock when network/parsing libraries are unavailable"
+    }
+  ],
+  "orchestrator": {
+    "name": "mcp_orchestrator",
+    "role": "auth passthrough + request logging only, no routing logic",
+    "dispatches": ["mcp_search_adapter", "mcp_extract_adapter"]
+  },
+  "deployment": {
+    "note": "Each adapter can run in-process (default, no infra required) or as its own Dockerized MCP server (architecture.md §7), reached over HTTP via mcp_orchestrator. Self-heals to in-process if the server is unreachable.",
+    "servers": [
+      {
+        "adapter": "mcp_search_adapter",
+        "server_module": "research_langgraph.tools.mcp_search_server",
+        "env_var": "MCP_SEARCH_URL",
+        "default_port": 8001
+      },
+      {
+        "adapter": "mcp_extract_adapter",
+        "server_module": "research_langgraph.tools.mcp_extract_server",
+        "env_var": "MCP_EXTRACT_URL",
+        "default_port": 8002
+      }
+    ]
+  },
+  "tool_count_budget": {
+    "note": "Keep each adapter well under 10-15 tools (Haiku-class accuracy threshold) / 20-30 (Sonnet-class). Split into a new Domain-Specific Adapter instead of growing an existing one.",
+    "current_counts": {
+      "mcp_search_adapter": 2,
+      "mcp_extract_adapter": 3
+    }
+  }
+}
