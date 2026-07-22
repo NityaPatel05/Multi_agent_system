@@ -1,0 +1,92 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: research
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-research}
+      POSTGRES_DB: research_langgraph
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U research"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    ports:
+      # Host-side port only — container-internal port (right side) stays 5432, which is
+      # what DATABASE_URL below uses via the `postgres` service name. Override the host
+      # side with POSTGRES_HOST_PORT if 5433 collides with something else on your machine.
+      - "${POSTGRES_HOST_PORT:-5433}:5432"
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    volumes:
+      - qdrant_data:/qdrant/storage
+    ports:
+      - "${QDRANT_HOST_PORT:-6343}:6333"
+
+  # Dockerized MCP search server (architecture.md §7) — standalone HTTP wrapper around
+  # tools/mcp_search_adapter.py. Can be rebuilt/redeployed on its own without touching
+  # the api service.
+  mcp-search:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.mcp
+    command: ["uvicorn", "research_langgraph.tools.mcp_search_server:app", "--host", "0.0.0.0", "--port", "8001"]
+    env_file:
+      - path: .env
+        required: false
+    ports:
+      # Host-side only, for direct curl testing — the api service reaches this over the
+      # internal network at mcp-search:8001 regardless of this mapping (see MCP_SEARCH_URL
+      # below). Override with MCP_SEARCH_HOST_PORT if 8011 collides on your machine.
+      - "${MCP_SEARCH_HOST_PORT:-8011}:8001"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8001/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Dockerized MCP extract server (architecture.md §7) — standalone HTTP wrapper around
+  # tools/mcp_extract_adapter.py.
+  mcp-extract:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.mcp
+    command: ["uvicorn", "research_langgraph.tools.mcp_extract_server:app", "--host", "0.0.0.0", "--port", "8002"]
+    env_file:
+      - path: .env
+        required: false
+    ports:
+      - "${MCP_EXTRACT_HOST_PORT:-8012}:8002"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8002/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DATABASE_URL: postgresql://research:${POSTGRES_PASSWORD:-research}@postgres:5432/research_langgraph
+      QDRANT_URL: http://qdrant:6333
+      MCP_SEARCH_URL: http://mcp-search:8001
+      MCP_EXTRACT_URL: http://mcp-extract:8002
+    ports:
+      - "${API_HOST_PORT:-8000}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mcp-search:
+        condition: service_healthy
+      mcp-extract:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+  qdrant_data:

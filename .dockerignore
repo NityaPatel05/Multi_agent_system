@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+**/__pycache__/
+*.pyc
+.git/
+.env
+*.db
+.episodic_store.json
+.claude/
+docs/
+README.md
