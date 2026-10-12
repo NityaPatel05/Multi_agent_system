@@ -1,11 +1,10 @@
 langgraph>=1.0
 langgraph-checkpoint-postgres>=2.0.0
 psycopg[binary,pool]>=3.1
-langchain-core
 pydantic>=2
 langsmith
-groq
-google-generativeai
+groq>=1.0
+google-genai>=1.0
 exa_py
 tavily-python
 pymupdf

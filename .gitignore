@@ -1,4 +1,4 @@
-﻿# Python
+# Python
 __pycache__/
 *.pyc
 *.pyo
@@ -16,12 +16,20 @@ env/
 .episodic_store.json
 
 # Claude AI files
-.claude/
+.claude/*
+!.claude/commands/
 CLAUDE.md
 
 # Documentation (push separately later)
 docs/
 
-# Evaluation suite (push separately later)
-eval/
+# Evaluation: commit eval/ (Dockerfile COPYs it); never commit mock-generated baselines
+eval/*.bak
 
+
+# Web frontend build artifacts
+web/node_modules/
+web/dist/
+
+# Generated run output
+output/

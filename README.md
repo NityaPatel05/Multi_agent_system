@@ -135,9 +135,9 @@ All LLM calls are routed through a single entry point: `call_structured()` in `r
 
 | Tier | Primary (Groq) | Fallback (Gemini) |
 |---|---|---|
-| Small | openai/gpt-oss-20b | gemini-2.5-flash |
-| Medium | qwen/qwen3.6-27b | gemini-2.5-flash |
-| High | openai/gpt-oss-120b | gemini-2.5-flash |
+| Small | openai/gpt-oss-20b | gemini-3.1-flash-lite |
+| Medium | openai/gpt-oss-120b | gemini-3.1-flash-lite |
+| High | openai/gpt-oss-120b | gemini-3.1-flash-lite |
 
 **Fallback chain for every call:**
 
@@ -161,7 +161,7 @@ Concurrent `Send()` fan-outs to Small-tier nodes are bounded by per-provider sem
 
 ### MCP Tool Layer
 
-Search and extraction are exposed as Model Context Protocol (MCP) tool servers that can run in-process or as independent Docker containers.
+Search and extraction are exposed as small HTTP tool services (REST, not the MCP wire protocol, despite the `mcp_*` file names) that can run in-process or as independent Docker containers.
 
 **Search tools** (`tools/mcp_search_adapter.py`):
 - Primary: Exa semantic search (requires `EXA_API_KEY`)
@@ -186,9 +186,9 @@ State is persisted using LangGraph's Postgres checkpointer (`langgraph-checkpoin
 - A crashed run shows `status: failed` to polling clients rather than appearing stuck at `running`
 - `mark_run_failed()` is called in every exception handler to ensure the terminal state is written
 
-A local SQLite checkpointer is used as the fallback when `POSTGRES_URL` is not set, keeping the system runnable for development without a running database.
+An in-memory checkpointer (not persistent across restarts) is used when `DATABASE_URL` is not set, keeping the system runnable for development without a running database.
 
-The episodic memory store (`memory/episodic_store.py`) uses Qdrant to persist summaries of past runs, enabling the planner to learn from previous research sessions.
+The episodic memory store (`memory/episodic_store.py`) uses Qdrant to persist summaries of past runs, intended to let the planner learn from previous sessions. **Not wired into the graph yet** - `store_run` / `retrieve_similar_runs` are never called.
 
 ### Observability
 
@@ -204,12 +204,17 @@ A FastAPI service (`api/main.py`) exposes the graph over HTTP:
 
 | Endpoint | Method | Description |
 |---|---|---|
-| `/research` | POST | Start a research run; returns `run_id` and initial status |
-| `/research/{run_id}` | GET | Poll run status, retrieve final report and evidence map |
-| `/research/{run_id}/stream` | GET | Server-Sent Events stream of status changes |
-| `/research/{run_id}/approve-plan` | POST | Resume from the human-approval interrupt with approval or feedback |
+| `/research` | POST | Start a run in the background; returns `202 {run_id, status:"queued"}` immediately |
+| `/research/{run_id}` | GET | Status, the plan (dimensions / queries / complexity / rationale) for the approval screen, final report and evidence map |
+| `/research/{run_id}/stream` | GET | Server-Sent Events: `node_started` / `node_finished` (with result sizes + audit entries), `awaiting_approval`, `done`, `failed`. Resume with `Last-Event-ID` |
+| `/research/{run_id}/approve-plan` | POST | Resume from the human-approval interrupt (202, runs in the background). `409` unless the run is awaiting approval and not already executing |
+| `/health`, `/ready` | GET | Liveness / readiness (ready checks the checkpointer) |
 
-The graph is instantiated once at startup (`lifespan`), with LangSmith tracing and the Postgres checkpointer configured at that point. Route handlers are synchronous, which keeps the implementation straightforward; the SSE stream handler offloads the blocking checkpoint call to a thread pool via `asyncio.to_thread`.
+**Security:** every route except `/health` and `/ready` requires `X-API-Key` (or `Authorization: Bearer`) matching `API_KEY`; if `API_KEY` is unset the API is open and logs a warning (docker-compose makes it mandatory). Run-starting routes are rate-limited per client (`RATE_LIMIT_PER_MIN`), concurrent runs are capped (`MAX_CONCURRENT_RUNS`, over capacity returns `429`), inputs are length-limited, and `budget_mode` is one of `fast|balanced|thorough`. Optional `CORS_ORIGINS` / `ALLOWED_HOSTS` settings are documented in `.env.example`. Browsers' `EventSource` cannot send headers, so a frontend should read the stream with `fetch`.
+
+The graph is built once at startup (`lifespan`). Runs execute on a bounded worker pool (`api/runs.py`); the event log is in-process memory (checkpoints in Postgres remain the source of truth, so after a restart old runs stay readable but lose their event history).
+
+**Extractor safety:** URLs are fetched through `tools/safe_fetch.py`: http(s) only, public IPs only (loopback, private, link-local/cloud-metadata blocked), connection pinned to the validated IP, every redirect hop re-validated (max 3), proxies ignored, size and total-time caps.
 
 ---
 
@@ -247,7 +252,7 @@ research_langgraph_setup/
 |   |   |-- mcp_registry.json       # Capability registry
 |   |
 |   |-- memory/
-|   |   |-- checkpointer.py         # Postgres / SQLite checkpointer factory
+|   |   |-- checkpointer.py         # Postgres / in-memory checkpointer factory
 |   |   |-- episodic_store.py       # Qdrant-backed episodic memory
 |   |
 |   |-- schemas/
@@ -276,7 +281,7 @@ research_langgraph_setup/
 
 **Prerequisites:**
 - Python 3.11 or later
-- PostgreSQL (optional; SQLite is used automatically if `POSTGRES_URL` is not set)
+- PostgreSQL (optional; an in-memory checkpointer is used if `DATABASE_URL` is not set)
 - Docker and Docker Compose (for containerized deployment)
 
 **Install dependencies:**
@@ -301,13 +306,13 @@ All configuration is read from environment variables (or `.env`):
 
 | Variable | Required | Description |
 |---|---|---|
-| `GROQ_API_KEY` | Recommended | API key for Groq (primary LLM provider) |
-| `GOOGLE_API_KEY` or `GEMINI_API_KEY` | Recommended | API key for Gemini (fallback LLM provider) |
+| `GROQ_API_KEY` | Recommended | Groq key (primary LLM provider). Accepts several comma-separated keys: on 429 (rate-limited) or 401/403 (revoked) the next key is used automatically, and the bad key is skipped for a cooldown. Other errors do not rotate keys. |
+| `GOOGLE_API_KEY` or `GEMINI_API_KEY` | Recommended | Gemini key (fallback provider); also accepts comma-separated keys, same failover behavior |
 | `EXA_API_KEY` | Recommended | API key for Exa semantic search |
 | `TAVILY_API_KEY` | Optional | API key for Tavily search (fallback to Exa) |
-| `POSTGRES_URL` | Optional | Postgres connection string for persistent checkpointing |
-| `LANGCHAIN_API_KEY` | Optional | LangSmith API key for tracing |
-| `LANGCHAIN_TRACING_V2` | Optional | Set to `true` to enable LangSmith tracing |
+| `DATABASE_URL` | Optional | Postgres connection string for persistent checkpointing |
+| `OFFLINE_MODE` | Optional | `1` forces offline placeholder extraction; unset = on only when no Exa/Tavily key is set |
+| `LANGSMITH_API_KEY` | Optional | LangSmith API key; tracing is enabled automatically when set |
 | `MCP_SEARCH_URL` | Optional | URL of a Dockerized MCP search server |
 | `MCP_EXTRACT_URL` | Optional | URL of a Dockerized MCP extract server |
 | `GROQ_MAX_CONCURRENCY` | Optional | Max concurrent Groq calls during fan-out (default: 4) |
@@ -333,7 +338,7 @@ The run blocks at the human-approval interrupt if `auto_approve=False`. When cal
 uvicorn research_langgraph.api.main:app --reload --port 8000
 ```
 
-Start a research run:
+Start a research run (add `-H "X-API-Key: $API_KEY"` to every call when `API_KEY` is set):
 
 ```bash
 curl -X POST http://localhost:8000/research \
@@ -359,20 +364,23 @@ curl http://localhost:8000/research/{run_id}
 
 ## Docker Deployment
 
-The `docker-compose.yml` starts four services:
+The `docker-compose.yml` starts five services:
 
 | Service | Description |
 |---|---|
-| `app` | Main FastAPI application with the LangGraph pipeline |
-| `mcp_search` | Standalone MCP search server (Exa / Tavily) |
-| `mcp_extract` | Standalone MCP extract server (PyMuPDF / BeautifulSoup) |
-| `postgres` | Postgres database for LangGraph checkpointing |
+| `api` | Main FastAPI application with the LangGraph pipeline (the only published port, on `127.0.0.1` by default) |
+| `mcp-search` | Standalone search tool service (Exa / Tavily); internal network only |
+| `mcp-extract` | Standalone extraction tool service (PyMuPDF / BeautifulSoup); internal only, receives no API keys |
+| `postgres` | Postgres for LangGraph checkpointing; internal only |
+| `qdrant` | Vector store for episodic memory (API-key protected); internal only |
+
+Before the first run set `API_KEY`, `TOOL_SERVICE_TOKEN`, `QDRANT_API_KEY` and `POSTGRES_PASSWORD` in `.env` (compose refuses to start without them; see `.env.example`). Images are built from `requirements.lock` (hash-pinned, regenerate with `uv pip compile requirements.txt -o requirements.lock --python-version 3.12 --python-platform linux --generate-hashes`), run as a non-root user, and the base image is pinned by digest.
 
 ```bash
-docker-compose up --build
+docker compose up --build
 ```
 
-With this setup, `MCP_SEARCH_URL` and `MCP_EXTRACT_URL` are automatically wired between containers. A failed or redeployed MCP server does not require restarting the main application container.
+`MCP_SEARCH_URL`, `MCP_EXTRACT_URL` and `TOOL_SERVICE_TOKEN` are wired between containers automatically. The "MCP" services are plain HTTP tool services (the graph calls them directly from deterministic nodes, so the MCP protocol would add a server/handshake per call without a second consumer to justify it); if the tool services are down, the API falls back to the in-process adapters.
 
 ---
 
@@ -403,7 +411,7 @@ Every completed run reports an `execution_quality` status in the evidence map:
 | Status | Meaning |
 |---|---|
 | `FULL` | All model and tool calls used live providers; report and metrics are fully reliable |
-| `PARTIAL` | One or more calls fell back to a secondary provider; report is still valid but coverage may be narrower |
+| `PARTIAL` | One or more non-critical nodes fell back to a mock; report is still valid but coverage may be narrower |
 | `DEGRADED` | One or more calls fell back to offline mocks; report content and quality metrics cannot be trusted |
 
 A `DEGRADED` report is annotated with a prominent warning in the final output. The Critic can also issue a `retry_degraded` directive, which skips a new search round and sends the run directly back to the Synthesizer for a fresh pass, on the assumption that the underlying extracted documents are still valid and only the LLM judgment layer was compromised.
@@ -416,8 +424,8 @@ The system applies the same fallback philosophy at every layer:
 
 - **Model calls:** Groq primary -> Gemini fallback -> deterministic mock
 - **Search tools:** Exa -> Tavily -> offline mock results
-- **Extraction tools:** PyMuPDF -> BeautifulSoup -> raw text fetch -> offline mock document
+- **Extraction tools:** PyMuPDF -> BeautifulSoup -> raw text fetch (HTML only) -> offline mock document (offline mode only; in live mode a failed fetch drops the source)
 - **MCP servers:** HTTP dispatch to Dockerized server -> in-process adapter fallback
-- **Checkpointer:** Postgres -> SQLite
+- **Checkpointer:** Postgres -> in-memory
 
 No failure at any single layer halts the graph. Every fallover event is recorded in the audit log and surfaces in `execution_quality`, so degraded output is always distinguishable from full-quality output.

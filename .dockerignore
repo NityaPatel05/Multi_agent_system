@@ -4,8 +4,15 @@ __pycache__/
 *.pyc
 .git/
 .env
+**/.env
+**/.env.*
+!.env.example
 *.db
+**/*.db
 .episodic_store.json
 .claude/
 docs/
 README.md
+tests/
+web/
+eval/*.bak
