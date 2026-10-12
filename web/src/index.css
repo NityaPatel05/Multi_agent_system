@@ -1,0 +1,11 @@
+@import "tailwindcss";
+
+:root { color-scheme: light dark; }
+body { @apply bg-stone-50 text-stone-900 antialiased; font-family: ui-sans-serif, system-ui, sans-serif; }
+@media (prefers-color-scheme: dark) { body { @apply bg-stone-950 text-stone-100; } }
+
+.prose-report h1 { @apply text-2xl font-semibold mb-3; }
+.prose-report h2 { @apply text-lg font-semibold mt-6 mb-2; }
+.prose-report p { @apply leading-7 my-2; }
+.prose-report ul { @apply list-disc pl-6 my-2; }
+.prose-report hr { @apply my-6 border-stone-300 dark:border-stone-700; }
