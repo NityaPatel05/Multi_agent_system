@@ -15,10 +15,13 @@ A production-grade, multi-agent research pipeline built on LangGraph. The system
   - [Memory and Checkpointing](#memory-and-checkpointing)
   - [Observability](#observability)
   - [API Layer](#api-layer)
+  - [Grounding Checks](#grounding-checks)
+  - [Web UI](#web-ui)
 - [Project Structure](#project-structure)
 - [Setup](#setup)
 - [Configuration](#configuration)
 - [Running the System](#running-the-system)
+- [Testing and Eval Gate](#testing-and-eval-gate)
 - [Docker Deployment](#docker-deployment)
 - [Budget Modes](#budget-modes)
 - [Execution Quality](#execution-quality)
@@ -123,7 +126,7 @@ The key design principle is that every fan-out uses LangGraph's `Send()` primiti
 | Extractor Agent | Small | Fetches full text for one source (PyMuPDF for PDFs, BeautifulSoup for HTML, raw fallback) |
 | Extraction Merge | Inline node | Consolidates extracted documents from all parallel branches |
 | Synthesizer | High | Produces a structured markdown report and claim list from extracted documents |
-| Evidence Verifier | High | Performs holistic judgment on each claim against extracted evidence spans |
+| Evidence Verifier | High | Performs holistic judgment on each claim against extracted evidence spans, combined with deterministic grounding checks (takes the stricter of the two) |
 | Critic | Medium | Reviews the evidence report, approves or issues targeted directives (re-search a dimension, resolve a contradiction, recite an uncited claim, retry a degraded run) |
 | Finalize | Inline node | Assembles the final report and structured evidence map, annotates with execution quality warnings |
 
@@ -216,6 +219,23 @@ The graph is built once at startup (`lifespan`). Runs execute on a bounded worke
 
 **Extractor safety:** URLs are fetched through `tools/safe_fetch.py`: http(s) only, public IPs only (loopback, private, link-local/cloud-metadata blocked), connection pinned to the validated IP, every redirect hop re-validated (max 3), proxies ignored, size and total-time caps.
 
+### Grounding Checks
+
+`agents/grounding.py` runs cheap, deterministic (no-LLM) checks before the Evidence Verifier trusts its own model: do the citations exist, does the cited text actually support the claim (lexical overlap of content words and all numbers), and does each planned dimension have enough supported claims. LLM judges tend to inflate scores for fluent, same-family output, so the Verifier takes the **stricter** of the LLM score and the grounding score. This reliably catches fabricated figures, invented names, and citations pointing at unrelated pages.
+
+### Web UI
+
+`web/` is a React 19 + TypeScript + Tailwind v4 frontend (Vite) with screens for starting a run, reviewing/approving the plan, watching live node progress over SSE, reading the cited report (markdown with citation links), and inspecting the audit trail.
+
+```bash
+cd web
+npm install
+npm run dev        # http://localhost:5173
+npm run build      # type-check + production build
+```
+
+The dev server proxies `/research` to the API (`API_HOST_PORT`, default 8000) and injects `X-API-Key` from the repo-root `.env`, so the key never ships in browser code and no CORS setup is needed.
+
 ---
 
 ## Project Structure
@@ -238,10 +258,13 @@ research_langgraph_setup/
 |   |   |-- evidence_verifier_agent.py
 |   |   |-- critic_agent.py
 |   |   |-- synthesizer_agent.py
+|   |   |-- grounding.py            # Deterministic citation/support checks
+|   |   |-- prompt_utils.py         # Prompt size caps and untrusted-text handling
 |   |
 |   |-- routing/
 |   |   |-- model_tiers.py          # Concrete model name registry (only place)
 |   |   |-- model_router.py         # call_structured(), tier resolution, fallback chain
+|   |   |-- api_keys.py             # Multi-key rotation with rate-limit/dead-key cooldowns
 |   |
 |   |-- tools/
 |   |   |-- mcp_orchestrator.py     # Thin dispatch layer (HTTP or in-process)
@@ -249,6 +272,7 @@ research_langgraph_setup/
 |   |   |-- mcp_search_server.py    # Standalone FastAPI MCP search server
 |   |   |-- mcp_extract_adapter.py  # PyMuPDF -> BeautifulSoup -> raw -> mock
 |   |   |-- mcp_extract_server.py   # Standalone FastAPI MCP extract server
+|   |   |-- safe_fetch.py           # SSRF-safe HTTP fetching for the extractor
 |   |   |-- mcp_registry.json       # Capability registry
 |   |
 |   |-- memory/
@@ -265,13 +289,18 @@ research_langgraph_setup/
 |   |
 |   |-- api/
 |       |-- main.py                 # FastAPI application
+|       |-- runs.py                 # Background run manager, SSE event log
+|       |-- security.py             # API-key auth, rate limiting
 |
+|-- web/                            # React + Vite frontend
+|-- tests/                          # Offline pytest suite
+|-- eval/topics/                    # Saved topics for the LLM-as-judge eval gate
 |-- docker/
 |   |-- Dockerfile.mcp              # Container image for MCP tool servers
 |
 |-- Dockerfile                      # Main application image
 |-- docker-compose.yml              # Wires app + MCP servers + Postgres + Qdrant
-|-- requirements.txt
+|-- requirements.txt / requirements-dev.txt / requirements.lock
 |-- .env.example
 ```
 
@@ -358,6 +387,27 @@ Poll for the completed report:
 
 ```bash
 curl http://localhost:8000/research/{run_id}
+```
+
+---
+
+## Testing and Eval Gate
+
+**Unit/integration tests** run fully offline (no API keys or network needed):
+
+```bash
+pip install -r requirements-dev.txt
+pytest                          # full suite
+pytest tests/test_grounding.py  # a single file while iterating
+```
+
+Coverage: the API (auth, rate limits, run lifecycle), the full graph on mock providers, grounding checks, API-key failover, and the SSRF-safe fetcher.
+
+**Eval gate:** any change to `routing/model_tiers.py`, `routing/model_router.py`, or an agent prompt must be scored against the saved topics in `eval/topics/` with the LLM-as-judge and compared to the last known-good baseline before merging (tolerance `EVAL_TOLERANCE`, default 0.05). The judge deliberately runs on a different model family than the pipeline.
+
+```bash
+python -m research_langgraph.observability.judge_eval                    # compare to baseline
+python -m research_langgraph.observability.judge_eval --update-baseline  # record a new baseline
 ```
 
 ---
