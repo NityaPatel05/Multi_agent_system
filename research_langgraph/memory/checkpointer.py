@@ -9,7 +9,21 @@ stays runnable — same graceful-degradation pattern used throughout tools/ and 
 from __future__ import annotations
 
 import os
-from typing import Optional
+import threading
+from typing import Dict, Optional, Tuple
+
+# One pool per DATABASE_URL, shared by every run_research()/API call in the process
+# (previously each call opened a fresh pool of up to 10 connections and never closed it).
+_lock = threading.Lock()
+_savers: Dict[str, Tuple[object, object]] = {}
+
+
+def close_checkpointers() -> None:
+    """Close all cached Postgres pools (call from app shutdown / end of an eval run)."""
+    with _lock:
+        for pool, _ in _savers.values():
+            pool.close()
+        _savers.clear()
 
 
 def get_checkpointer(database_url: Optional[str] = None):
@@ -24,10 +38,20 @@ def get_checkpointer(database_url: Optional[str] = None):
         from langgraph.checkpoint.postgres import PostgresSaver
         from psycopg_pool import ConnectionPool
 
-        pool = ConnectionPool(conninfo=db_url, max_size=10, kwargs={"autocommit": True})
-        checkpointer = PostgresSaver(pool)
-        checkpointer.setup()
-        return checkpointer
+        from psycopg.rows import dict_row
+
+        with _lock:
+            cached = _savers.get(db_url)
+            if cached is not None:
+                return cached[1]
+            pool = ConnectionPool(
+                conninfo=db_url, max_size=10, open=True,
+                kwargs={"autocommit": True, "prepare_threshold": 0, "row_factory": dict_row},
+            )
+            checkpointer = PostgresSaver(pool)
+            checkpointer.setup()
+            _savers[db_url] = (pool, checkpointer)
+            return checkpointer
 
     from langgraph.checkpoint.memory import InMemorySaver
 

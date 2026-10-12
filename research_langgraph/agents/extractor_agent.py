@@ -16,6 +16,7 @@ def extractor_agent(state: dict) -> dict:
     dimension = state.get("dimension", "")
     doc, audit = mcp_orchestrator.dispatch_extract("extractor_agent", source_id, url)
     doc["dimension"] = dimension
+    doc["dimensions"] = state.get("dimensions") or [dimension]
     # Only a full mock counts as a fallback worth flagging — a "raw" fallback is still
     # real fetched content, just without proper parsing (see extraction_fallbacks).
     fallback_history = [

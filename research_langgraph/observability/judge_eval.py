@@ -8,23 +8,34 @@ baseline before merging — this is what `/eval-gate` runs.
 from __future__ import annotations
 
 import json
+import logging
+import os
 from pathlib import Path
 from typing import Optional
 
 from pydantic import BaseModel, Field
 
 from research_langgraph.routing.model_router import call_structured
+from research_langgraph.routing.model_tiers import JUDGE_BINDINGS
+
+logger = logging.getLogger(__name__)
 
 _EVAL_DIR = Path(__file__).resolve().parent.parent.parent / "eval"
 _BASELINE_PATH = _EVAL_DIR / "baseline_scores.json"
 _TOPICS_DIR = _EVAL_DIR / "topics"
 
 JUDGE_SYSTEM_PROMPT = """You are an impartial judge scoring a research report against its
-source topic. Score three dimensions from 0.0 to 1.0:
-- citation_accuracy: do claims in the report actually match what their cited sources say?
-- coverage: does the report address the topic's expected dimensions thoroughly?
-- hallucination_rate: groundedness, where 1.0 = no hallucinated/uncited claims found and
-  0.0 = pervasive hallucination (higher is better, despite the name).
+source topic. Score three dimensions from 0.0 to 1.0. ALL are higher-is-better. Judge each
+independently and be strict; most reports should NOT score above 0.8. Anchors:
+- citation_accuracy: 1.0 = every claim matches what its cited source says; 0.7 = most do,
+  a few are loosely supported; 0.4 = many claims are only tangentially supported; 0.0 =
+  citations do not support the claims.
+- coverage: 1.0 = every expected dimension has a dedicated, substantive, specific section;
+  0.7 = all present but some thin; 0.4 = one or more dimensions missing or superficial;
+  0.0 = the report ignores the topic's main aspects.
+- hallucination_rate (groundedness; higher is better despite the name): 1.0 = no
+  unsupported or invented facts/figures found; 0.7 = a few unsupported details; 0.4 =
+  several unsupported claims; 0.0 = pervasive invention.
 Return the three scores plus a one-sentence rationale for each.
 """
 
@@ -34,6 +45,17 @@ class JudgeScore(BaseModel):
     coverage: float = Field(ge=0.0, le=1.0)
     hallucination_rate: float = Field(ge=0.0, le=1.0)
     rationale: str = ""
+
+
+def _cap_with_grounding(score: JudgeScore, evidence_map: dict) -> JudgeScore:
+    """The LLM judge is never allowed to be MORE generous than the deterministic checks."""
+    g = (evidence_map.get("evidence_report") or {}).get("grounding") or {}
+    if not g:
+        return score
+    return score.model_copy(update={
+        "citation_accuracy": min(score.citation_accuracy, g.get("claim_support_rate", 1.0)),
+        "hallucination_rate": min(score.hallucination_rate, g.get("cited_claim_rate", 1.0)),
+    })
 
 
 def _mock_judge(topic: str, report: str, evidence_map: dict) -> JudgeScore:
@@ -56,6 +78,12 @@ def _mock_judge(topic: str, report: str, evidence_map: dict) -> JudgeScore:
 
 
 def judge_report(topic: str, report: str, evidence_map: dict, budget_mode: str = "balanced") -> JudgeScore:
+    return judge_report_checked(topic, report, evidence_map, budget_mode)[0]
+
+
+def judge_report_checked(topic: str, report: str, evidence_map: dict,
+                         budget_mode: str = "balanced") -> tuple[JudgeScore, bool]:
+    """Returns (score, used_mock) so the gate can refuse to trust offline/mock scores."""
     parsed, _result = call_structured(
         node_name="critic",  # reuses the Medium tier; the judge isn't a graph node itself
         system=JUDGE_SYSTEM_PROMPT,
@@ -63,8 +91,20 @@ def judge_report(topic: str, report: str, evidence_map: dict, budget_mode: str =
         schema=JudgeScore,
         mock_fn=lambda: _mock_judge(topic, report, evidence_map),
         budget_mode=budget_mode,
+        bindings=(JUDGE_BINDINGS["primary"], JUDGE_BINDINGS["fallback"]),
     )
-    return parsed
+    if _result.provider == JUDGE_BINDINGS["fallback"]["provider"] and not _result.used_mock:
+        logger.warning("judge fell back to the pipeline's own provider; scores are self-graded")
+    parsed = _cap_with_grounding(parsed, evidence_map)
+    return parsed, _result.used_mock
+
+
+EVAL_TOLERANCE = float(os.environ.get("EVAL_TOLERANCE", "0.05"))
+
+
+def _worse(dim: str, new: float, old: float) -> bool:
+    # all three scores are higher-is-better (hallucination_rate is groundedness)
+    return new < old - EVAL_TOLERANCE
 
 
 def load_baseline() -> dict:
@@ -106,9 +146,15 @@ def run_eval_gate(topics: Optional[list[str]] = None) -> dict:
     for topic in topics:
         try:
             final_state = run_research(topic, auto_approve=True)
-            score = judge_report(
+            score, judge_mock = judge_report_checked(
                 topic, final_state.get("final_report", ""), final_state.get("evidence_map", {})
             )
+            quality = (final_state.get("execution_quality") or {}).get("status")
+            if judge_mock or quality == "DEGRADED":
+                raise RuntimeError(
+                    f"untrustworthy run (judge_mock={judge_mock}, execution_quality={quality}); "
+                    "scores from mocks must not be compared to or saved as a baseline"
+                )
         except Exception as e:
             failures.append({"topic": topic, "error": str(e)})
             continue
@@ -118,7 +164,8 @@ def run_eval_gate(topics: Optional[list[str]] = None) -> dict:
         prior = baseline.get(topic)
         if prior:
             for dim in ("citation_accuracy", "coverage", "hallucination_rate"):
-                if results[topic][dim] < prior.get(dim, 0):
+                # tolerance: an LLM judge is noisy, so only flag drops beyond it
+                if _worse(dim, results[topic][dim], prior.get(dim, 0)):
                     regressions.append({
                         "topic": topic,
                         "dimension": dim,
@@ -130,12 +177,24 @@ def run_eval_gate(topics: Optional[list[str]] = None) -> dict:
 
 
 if __name__ == "__main__":
+    import sys
+
+    from dotenv import load_dotenv
+
+    from research_langgraph.memory.checkpointer import close_checkpointers
+
+    load_dotenv()  # entrypoint-only
     report = run_eval_gate()
+    close_checkpointers()
     print(json.dumps(report, indent=2))
     if report["failures"]:
-        print(f"\n{len(report['failures'])} topic(s) FAILED to run — do not ship until resolved.")
-    elif report["regressions"]:
-        print(f"\nREGRESSIONS FOUND ({len(report['regressions'])}) — do not ship.")
-    else:
+        print(f"\n{len(report['failures'])} topic(s) FAILED to run - do not ship until resolved.")
+        sys.exit(1)
+    if report["regressions"]:
+        print(f"\nREGRESSIONS FOUND ({len(report['regressions'])}) - do not ship.")
+        sys.exit(1)
+    if "--update-baseline" in sys.argv:
         save_baseline(report["results"])
         print("\nNo regressions. Baseline updated.")
+    else:
+        print("\nNo regressions. (Pass --update-baseline to save these scores as the new baseline.)")

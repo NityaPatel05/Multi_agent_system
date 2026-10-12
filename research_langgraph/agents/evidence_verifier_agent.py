@@ -11,6 +11,8 @@ from __future__ import annotations
 from collections import Counter
 from typing import List
 
+from research_langgraph.agents import grounding
+from research_langgraph.agents.prompt_utils import UNTRUSTED_NOTE, render_documents
 from research_langgraph.routing.model_router import call_structured, fallback_history_entries
 from research_langgraph.schemas.validated_outputs import (
     CitationCompleteness,
@@ -25,7 +27,11 @@ documents backing them, the source list, and the Planner's dimension list, produ
 structured object with:
 1. claim_confidence: per-claim High/Medium/Unverified confidence based on how well the
    extracted text actually supports it.
-2. coverage: per-dimension score 0-1 against the Planner's dimensions.
+2. coverage: per-dimension score 0-1 against the Planner's dimensions. Use this anchored
+   scale and be strict - do NOT give 1.0 unless you checked the documents yourself:
+   1.0 = the report has a dedicated section for the dimension with at least 2 distinct
+   claims, each clearly supported by the documents it cites; 0.5 = a section exists but is
+   thin, vague, or only partly supported; 0.0 = no section, or no supported claims.
 3. contradictions: any sub-topics where sources disagree.
 4. source_types: classify EVERY source (Academic/Government/Company/Documentation/GitHub/
    News/Books/Other) — this is the only place source classification happens.
@@ -33,7 +39,7 @@ structured object with:
    over-indexing.
 6. citation_completeness: list any claim with no supporting source_ids as uncited, plus
    an overall completeness_score.
-"""
+""" + UNTRUSTED_NOTE
 
 
 def _classify(url: str) -> SourceType:
@@ -86,10 +92,40 @@ def _mock_verify(dimensions: List[str], claims: List[dict], sources: List[dict])
     )
 
 
+def _apply_grounding(parsed: EvidenceVerifierOutput, state: dict, dimensions: List[str],
+                     claims: List[dict], documents: List[dict]) -> dict:
+    """Run the deterministic checks and combine with the LLM's judgment, taking the STRICTER
+    of the two (LLM judges inflate). Also recomputes citation completeness from the actual
+    citations rather than trusting the model's self-report."""
+    evals = grounding.evaluate_claims(claims, documents)
+    det_cov = grounding.dimension_coverage(dimensions, claims, evals, state.get("report_markdown", ""))
+    out = parsed.model_dump(mode="json")
+
+    out["coverage"] = {d: round(min(out["coverage"].get(d, det_cov[d]), det_cov[d]), 2) for d in dimensions}
+
+    conf = dict(out["claim_confidence"])
+    for c in claims:
+        e = evals.get(c["id"], {"cited": 0, "support": 0.0})
+        if e["cited"] == 0 or e["support"] < grounding.LOW_SUPPORT:
+            conf[c["id"]] = Confidence.unverified.value
+        elif e["support"] < grounding.SUPPORT_THRESHOLD and conf.get(c["id"]) == Confidence.high.value:
+            conf[c["id"]] = Confidence.medium.value
+    out["claim_confidence"] = conf
+
+    uncited = [c["text"] for c in claims if evals.get(c["id"], {}).get("cited", 0) == 0]
+    out["citation_completeness"] = {
+        "uncited_claims": uncited,
+        "completeness_score": round(1 - len(uncited) / max(1, len(claims)), 2),
+    }
+    out["grounding"] = grounding.summary_metrics(claims, evals, int(state.get("citations_removed", 0)))
+    return out
+
+
 def evidence_verifier_agent(state: dict) -> dict:
     dimensions = state.get("dimensions", [])
     claims = state.get("claims", [])
-    sources = state.get("sources", [])
+    # only Validator-accepted sources: rejected/spam ones must not skew diversity/coverage
+    sources = state.get("validated_sources", state.get("sources", []))
     documents = state.get("documents", [])
     budget_mode = state.get("budget_mode", "balanced")
     parsed, result = call_structured(
@@ -97,14 +133,15 @@ def evidence_verifier_agent(state: dict) -> dict:
         system=SYSTEM_PROMPT,
         user=(
             f"Dimensions: {dimensions}\nClaims: {claims}\nSources: {sources}\n"
-            f"Documents: {documents}"
+            f"Documents: {render_documents(documents)}"
         ),
         schema=EvidenceVerifierOutput,
         mock_fn=lambda: _mock_verify(dimensions, claims, sources),
         budget_mode=budget_mode,
     )
+    report = _apply_grounding(parsed, state, dimensions, claims, documents)
     return {
-        "evidence_report": parsed.model_dump(mode="json"),
+        "evidence_report": report,
         "evidence_verifier_used_mock": result.used_mock,
         "audit_log": result.audit_entries(),
         "token_usage": [result.token_usage_entry()],

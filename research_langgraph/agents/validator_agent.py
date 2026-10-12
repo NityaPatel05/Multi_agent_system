@@ -71,19 +71,40 @@ def validator_agent(state: dict) -> dict:
     by_id = {s["id"]: s for s in sources}
     budget_mode = state.get("budget_mode", "balanced")
 
-    parsed, result = call_structured(
-        node_name="validator",
-        system=SYSTEM_PROMPT,
-        user=f"Sources:\n{_brief(sources)}",
-        schema=ValidatorOutput,
-        mock_fn=lambda: _mock_validate(sources),
-        budget_mode=budget_mode,
-    )
+    # Earlier rounds' decisions are final: only NEW sources go to the model. Re-judging
+    # old ones each round is wasteful and non-deterministic (an already-extracted source
+    # could flip to "rejected" while its document stayed in state).
+    prior_valid = [s for s in state.get("validated_sources", []) if s["id"] in by_id]
+    decided = {s["id"] for s in prior_valid} | set(state.get("rejection_reasons", {}))
+    fresh = [s for s in sources if s["id"] not in decided]
 
-    # Reconstruct full records in code from the original list — the model never had to
-    # (and couldn't) mangle them, since it only ever dealt with ids.
-    validated_sources = [by_id[i] for i in parsed.accepted_ids if i in by_id]
-    rejected_urls = [by_id[i]["url"] for i in parsed.rejected_ids if i in by_id]
+    new_accepted: List[dict] = []
+    new_reasons: Dict[str, str] = {}
+    audit, tokens, fallbacks = [], [], []
+    if fresh:
+        parsed, result = call_structured(
+            node_name="validator",
+            system=SYSTEM_PROMPT,
+            user=f"Sources:\n{_brief(fresh)}",
+            schema=ValidatorOutput,
+            mock_fn=lambda: _mock_validate(fresh),
+            budget_mode=budget_mode,
+        )
+        fresh_ids = {s["id"] for s in fresh}
+        # Reconstruct full records in code from the original list — the model only ever
+        # dealt with ids. Duplicate ids are collapsed; unknown ids ignored.
+        accepted_ids = list(dict.fromkeys(i for i in parsed.accepted_ids if i in fresh_ids))
+        new_accepted = [by_id[i] for i in accepted_ids]
+        # Any id the model left out of BOTH lists is rejected with a reason (never vanishes).
+        for s in fresh:
+            if s["id"] not in accepted_ids:
+                new_reasons[s["id"]] = parsed.reasons.get(s["id"]) or "not accepted by validator"
+        audit, tokens = result.audit_entries(), [result.token_usage_entry()]
+        fallbacks = fallback_history_entries(result)
+
+    validated_sources = prior_valid + new_accepted
+    all_reasons = {**state.get("rejection_reasons", {}), **new_reasons}
+    rejected_urls = [by_id[i]["url"] for i in all_reasons if i in by_id]
     credible_count = len(validated_sources)
 
     return {
@@ -91,8 +112,8 @@ def validator_agent(state: dict) -> dict:
         "rejected_urls": rejected_urls,
         "credible_count": credible_count,
         "needs_broader_search": credible_count < _CREDIBLE_THRESHOLD,
-        "rejection_reasons": parsed.reasons,
-        "audit_log": result.audit_entries(),
-        "token_usage": [result.token_usage_entry()],
-        "fallback_history": fallback_history_entries(result),
+        "rejection_reasons": new_reasons,
+        "audit_log": audit,
+        "token_usage": tokens,
+        "fallback_history": fallbacks,
     }

@@ -70,6 +70,7 @@ class ResearchState(TypedDict, total=False):
     complexity: str  # simple | medium | complex
     plan_rationale: str
     plan_approved: Optional[bool]  # set by the human-approval interrupt
+    in_targeted_rerun: bool  # True while a Critic-directed re-search is in flight (blocks a full re-plan)
     is_broaden: bool  # True when re-entering Planner from the Validator broaden loop
     search_broaden_hint: str
     plan_revision_hint: str  # set when the human rejects the plan at the approval gate
@@ -100,6 +101,7 @@ class ResearchState(TypedDict, total=False):
     # ---- Synthesizer ----
     report_markdown: str
     claims: List[dict]
+    citations_removed: int  # citations to non-existent source ids dropped by the Synthesizer
     synthesizer_used_mock: bool  # last-write-wins: reflects the MOST RECENT synthesis pass
 
     # ---- Evidence Verifier (single holistic-judgment object) ----

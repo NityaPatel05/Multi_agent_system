@@ -14,7 +14,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import Dict, List, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 # --------------------------------------------------------------------------- #
@@ -249,6 +249,8 @@ class EvidenceVerifierOutput(BaseModel):
     source_diversity: Dict[str, float] = Field(default_factory=dict)
     diversity_flag: str = ""
     citation_completeness: CitationCompleteness = Field(default_factory=CitationCompleteness)
+    # Deterministic (non-LLM) grounding metrics: cited_claim_rate, claim_support_rate, ...
+    grounding: Dict[str, float] = Field(default_factory=dict)
 
     @field_validator("coverage", "source_diversity")
     @classmethod
@@ -282,10 +284,11 @@ class CriticOutput(BaseModel):
     directives: List[ReRunDirective] = Field(default_factory=list)
     summary: str = ""
 
-    @field_validator("directives")
-    @classmethod
-    def _directives_match_approval(cls, v, info):
-        approved = info.data.get("approved")
+    # mode="after" on the whole model (not field_validator("directives")): Pydantic skips
+    # field validators for omitted/default values, so `{"approved": false}` slipped through.
+    @model_validator(mode="after")
+    def _directives_match_approval(self):
+        approved, v = self.approved, self.directives
         if approved and v:
             raise ValueError("an approved report must not carry re-run directives")
         if approved is False and not v:
@@ -295,7 +298,7 @@ class CriticOutput(BaseModel):
             # Critic actually disliked. Forces the built-in corrective retry in
             # model_router.call_structured to make the model say what's wrong.
             raise ValueError("a rejected report must specify at least one targeted directive")
-        return v
+        return self
 
 
 __all__ = [

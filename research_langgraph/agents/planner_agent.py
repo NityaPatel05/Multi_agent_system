@@ -9,8 +9,12 @@ plan-approval checkpoint feature.
 
 from __future__ import annotations
 
+import logging
+
 from research_langgraph.routing.model_router import call_structured, fallback_history_entries
 from research_langgraph.schemas.validated_outputs import Complexity, PlannerOutput
+
+logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = """You are the Planner agent in a multi-agent research system.
 Decompose the given topic into the DIMENSIONS a complete answer needs (e.g. Definition,
@@ -36,6 +40,28 @@ def _mock_plan(topic: str) -> PlannerOutput:
     )
 
 
+def _episodic_hint(topic: str) -> str:
+    """Episodic memory (our OWN past runs only - never live-web RAG): show the planner the
+    dimensions earlier, similar runs used. Best-effort; any failure just means no hint."""
+    try:
+        from research_langgraph.memory.episodic_store import retrieve_similar_runs
+
+        past = retrieve_similar_runs(topic, top_k=2)
+    except Exception:
+        logger.warning("episodic memory lookup failed; planning without it", exc_info=True)
+        return ""
+    lines = []
+    for r in past:
+        cov = (r.get("evidence_map") or {}).get("evidence_report", {}).get("coverage") or {}
+        names = list(cov) if isinstance(cov, dict) else []
+        if r.get("topic") and names:
+            lines.append(f"- \"{str(r['topic'])[:120]}\": {', '.join(str(n)[:60] for n in names[:8])}")
+    if not lines:
+        return ""
+    return ("\n\nFor reference, earlier runs on similar topics covered these dimensions "
+            "(adapt, don't copy blindly):\n" + "\n".join(lines))
+
+
 def planner_agent(state: dict) -> dict:
     topic = state["topic"]
     budget_mode = state.get("budget_mode", "balanced")
@@ -49,6 +75,9 @@ def planner_agent(state: dict) -> dict:
         )
     elif state.get("plan_revision_hint"):
         hint = f"\n\nThe user requested changes to the previous plan: {state['plan_revision_hint']}"
+
+    if not state.get("is_broaden") and not state.get("plan_revision_hint"):
+        hint += _episodic_hint(topic)
 
     parsed, result = call_structured(
         node_name="planner",

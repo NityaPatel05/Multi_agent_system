@@ -20,6 +20,9 @@ from typing import Callable, Optional, Tuple, Type, TypeVar
 
 from pydantic import BaseModel, ValidationError
 
+from research_langgraph.routing.api_keys import (
+    DEAD_KEY_COOLDOWN_S, RATE_LIMIT_COOLDOWN_S, KeyPool, call_with_failover, parse_keys,
+)
 from research_langgraph.routing.model_tiers import FALLBACK_BINDINGS, TIER_BINDINGS
 
 T = TypeVar("T", bound=BaseModel)
@@ -79,17 +82,33 @@ def _estimate_tokens(text: str) -> int:
     return max(1, len(text) // 4)
 
 
+_groq_pool = KeyPool()
+_gemini_pool = KeyPool()
+_GROQ_MAX_REQUEST_TOKENS = int(os.environ.get("GROQ_MAX_REQUEST_TOKENS", "7000"))
+_PROVIDER_TIMEOUT_S = float(os.environ.get("PROVIDER_TIMEOUT_S", "60"))
+
+
 def _call_groq(model: str, system: str, user: str) -> Tuple[str, int, int]:
-    api_key = os.environ.get("GROQ_API_KEY")
-    if not api_key:
+    keys = parse_keys("GROQ_API_KEY")
+    if not os.environ.get("GROQ_API_KEY"):
         raise ProviderError("GROQ_API_KEY not set")
     try:
+        import groq
         from groq import Groq  # lazy import: optional dependency
     except ImportError as e:
         raise ProviderError(f"groq package unavailable: {e}") from e
 
-    with _semaphores["groq"]:
-        client = Groq(api_key=api_key)
+    est = _estimate_tokens(system + user)
+    if est > _GROQ_MAX_REQUEST_TOKENS:
+        # Groq answers 413 for requests over the model's tokens-per-minute budget; going
+        # straight to the fallback saves a doomed call (and a key-cooldown lookup).
+        raise ProviderError(f"request ~{est} tokens exceeds GROQ_MAX_REQUEST_TOKENS="
+                            f"{_GROQ_MAX_REQUEST_TOKENS}; skipping groq")
+
+    def attempt(api_key: str) -> Tuple[str, int, int]:
+        # max_retries=0: the SDK's own backoff would stall while holding the semaphore;
+        # key failover + the Gemini tier fallback are the retry strategy here.
+        client = Groq(api_key=api_key, max_retries=0, timeout=_PROVIDER_TIMEOUT_S)
         resp = client.chat.completions.create(
             model=model,
             messages=[
@@ -99,35 +118,74 @@ def _call_groq(model: str, system: str, user: str) -> Tuple[str, int, int]:
             temperature=0.2,
             response_format={"type": "json_object"},
         )
-    content = resp.choices[0].message.content or ""
-    usage = getattr(resp, "usage", None)
-    prompt_tok = getattr(usage, "prompt_tokens", None) or _estimate_tokens(system + user)
-    completion_tok = getattr(usage, "completion_tokens", None) or _estimate_tokens(content)
-    return content, prompt_tok, completion_tok
+        content = resp.choices[0].message.content or ""
+        usage = getattr(resp, "usage", None)
+        prompt_tok = getattr(usage, "prompt_tokens", None) or _estimate_tokens(system + user)
+        completion_tok = getattr(usage, "completion_tokens", None) or _estimate_tokens(content)
+        return content, prompt_tok, completion_tok
+
+    def classify(e: Exception) -> Optional[float]:
+        if isinstance(e, groq.RateLimitError):
+            return RATE_LIMIT_COOLDOWN_S
+        if isinstance(e, (groq.AuthenticationError, groq.PermissionDeniedError)):
+            return DEAD_KEY_COOLDOWN_S
+        return None
+
+    def transient(e: Exception) -> bool:
+        return isinstance(e, (groq.APIConnectionError, groq.APITimeoutError, groq.InternalServerError))
+
+    with _semaphores["groq"]:
+        return call_with_failover(_groq_pool, keys, attempt, classify, "groq", transient)
 
 
 def _call_gemini(model: str, system: str, user: str) -> Tuple[str, int, int]:
-    api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
-    if not api_key:
+    keys = parse_keys("GOOGLE_API_KEY", "GEMINI_API_KEY")
+    if not (os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")):
         raise ProviderError("GOOGLE_API_KEY/GEMINI_API_KEY not set")
     try:
-        import google.generativeai as genai  # lazy import: optional dependency
+        from google import genai  # lazy import: optional dependency (google-genai SDK)
+        from google.genai import errors as genai_errors
+        from google.genai import types as genai_types
     except ImportError as e:
-        raise ProviderError(f"google-generativeai package unavailable: {e}") from e
+        raise ProviderError(f"google-genai package unavailable: {e}") from e
+
+    def attempt(api_key: str) -> Tuple[str, int, int]:
+        # One client per key: no process-global state, so concurrent calls can't swap keys.
+        client = genai.Client(
+            api_key=api_key,
+            http_options=genai_types.HttpOptions(timeout=int(_PROVIDER_TIMEOUT_S * 1000)),
+        )
+        resp = client.models.generate_content(
+            model=model,
+            contents=user,
+            config=genai_types.GenerateContentConfig(
+                system_instruction=system,
+                response_mime_type="application/json",
+                temperature=0.2,
+            ),
+        )
+        content = resp.text or ""
+        meta = getattr(resp, "usage_metadata", None)
+        prompt_tok = getattr(meta, "prompt_token_count", None) or _estimate_tokens(system + user)
+        completion_tok = getattr(meta, "candidates_token_count", None) or _estimate_tokens(content)
+        return content, prompt_tok, completion_tok
+
+    def classify(e: Exception) -> Optional[float]:
+        if isinstance(e, genai_errors.APIError):
+            code = getattr(e, "code", None)
+            if code == 429:
+                return RATE_LIMIT_COOLDOWN_S
+            if code in (401, 403) or (code == 400 and "API_KEY_INVALID" in str(e)):
+                return DEAD_KEY_COOLDOWN_S
+        return None
+
+    def transient(e: Exception) -> bool:
+        if isinstance(e, genai_errors.APIError):
+            return getattr(e, "code", None) in (500, 502, 503, 504)
+        return type(e).__name__ in {"ConnectError", "ReadTimeout", "ConnectTimeout", "RemoteProtocolError"}
 
     with _semaphores["gemini"]:
-        genai.configure(api_key=api_key)
-        gm = genai.GenerativeModel(
-            model,
-            system_instruction=system,
-            generation_config={"response_mime_type": "application/json", "temperature": 0.2},
-        )
-        resp = gm.generate_content(user)
-    content = resp.text or ""
-    meta = getattr(resp, "usage_metadata", None)
-    prompt_tok = getattr(meta, "prompt_token_count", None) or _estimate_tokens(system + user)
-    completion_tok = getattr(meta, "candidates_token_count", None) or _estimate_tokens(content)
-    return content, prompt_tok, completion_tok
+        return call_with_failover(_gemini_pool, keys, attempt, classify, "gemini", transient)
 
 
 _PROVIDER_CALLERS: dict[str, Callable[[str, str, str], Tuple[str, int, int]]] = {
@@ -242,6 +300,7 @@ def call_structured(
     schema: Type[T],
     mock_fn: Callable[[], T],
     budget_mode: str = "balanced",
+    bindings: Optional[Tuple[dict, dict]] = None,
 ) -> Tuple[T, RoutedCallResult]:
     """Resolve node -> tier -> (Groq primary, Gemini fallback), validate against `schema`,
     retry once on a validation error with a corrective prompt, and fall back to `mock_fn`
@@ -251,8 +310,9 @@ def call_structured(
     audit/token entries to ResearchState.
     """
     tier = _resolve_tier(node_name, budget_mode)
-    primary = TIER_BINDINGS[tier]
-    fallback = FALLBACK_BINDINGS[tier]
+    # `bindings=(primary, fallback)` overrides the tier lookup (used by the eval judge so it
+    # runs on a different model family than the pipeline it grades).
+    primary, fallback = bindings if bindings else (TIER_BINDINGS[tier], FALLBACK_BINDINGS[tier])
     schema_hint = (
         f"\n\nRespond with ONLY a single JSON object matching this schema "
         f"(no markdown fences, no commentary):\n{json.dumps(schema.model_json_schema())}"

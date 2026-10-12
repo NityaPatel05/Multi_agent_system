@@ -10,6 +10,7 @@ judgment (hard rule).
 
 from __future__ import annotations
 
+import logging
 import uuid
 from typing import List, Union
 
@@ -17,6 +18,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, Send, interrupt
 
 from research_langgraph.agents.critic_agent import critic_agent
+from research_langgraph.agents.prompt_utils import strip_links_and_images
 from research_langgraph.agents.evidence_verifier_agent import evidence_verifier_agent
 from research_langgraph.agents.extraction_merge import extraction_merge
 from research_langgraph.agents.extractor_agent import extractor_agent
@@ -28,6 +30,8 @@ from research_langgraph.agents.validator_agent import validator_agent
 from research_langgraph.memory.checkpointer import get_checkpointer
 from research_langgraph.observability.execution_quality import format_execution_quality_caveat
 from research_langgraph.state import ResearchState
+
+logger = logging.getLogger(__name__)
 
 # --------------------------------------------------------------------------- #
 # Supervisor budget table (architecture.md §3) — derived ONCE from Planner's
@@ -135,6 +139,23 @@ def prepare_rerun_node(state: dict) -> dict:
     }
 
 
+def _remember_run(state: dict, execution_quality: dict) -> None:
+    """Best-effort write to episodic memory. Skips DEGRADED runs (mock content/judgment
+    must not become 'prior knowledge') and never fails the run."""
+    if execution_quality.get("status") == "DEGRADED" or not state.get("approved"):
+        return
+    try:
+        from research_langgraph.memory.episodic_store import store_run
+
+        store_run(
+            state.get("run_id", ""), state.get("topic", ""),
+            state.get("validated_sources", []), state.get("report_markdown", ""),
+            {"evidence_report": state.get("evidence_report", {})},
+        )
+    except Exception:
+        logger.warning("could not write run to episodic memory", exc_info=True)
+
+
 def finalize_node(state: dict) -> dict:
     """Assemble the final markdown report + evidence map (CLAUDE.md's #2 differentiating
     feature: structured claim -> evidence span -> source -> confidence JSON alongside the
@@ -154,12 +175,14 @@ def finalize_node(state: dict) -> dict:
             f"{state.get('critic_summary', '')}*"
         )
 
+    _remember_run(state, execution_quality)
+
     return {
-        "final_report": state.get("report_markdown", "") + "".join(caveats),
+        "final_report": strip_links_and_images(state.get("report_markdown", "")) + "".join(caveats),
         "evidence_map": {
             "claims": state.get("claims", []),
             "evidence_report": state.get("evidence_report", {}),
-            "sources": state.get("sources", []),
+            "sources": state.get("validated_sources", state.get("sources", [])),
             "execution_quality": execution_quality,
             "fallback_history": state.get("fallback_history", []),
             "rejection_reasons": state.get("rejection_reasons", {}),
@@ -192,7 +215,8 @@ def route_to_extract(state: dict) -> Union[str, List[Send]]:
     if not to_extract:
         return "extraction_merge"
     return [
-        Send("extractor_agent", {"source_id": s["id"], "url": s["url"], "dimension": s.get("dimension", "")})
+        Send("extractor_agent", {"source_id": s["id"], "url": s["url"], "dimension": s.get("dimension", ""),
+                                 "dimensions": s.get("dimensions") or [s.get("dimension", "")]})
         for s in to_extract
     ]
 
@@ -326,6 +350,15 @@ if __name__ == "__main__":
     import json
     import sys
 
+    from dotenv import load_dotenv
+
+    import logging
+
+    from research_langgraph.observability.langsmith_setup import configure_langsmith
+
+    load_dotenv()  # entrypoint-only; importing the package never reads .env
+    logging.basicConfig(level=logging.INFO)
+    configure_langsmith()
     topic_arg = " ".join(sys.argv[1:]) or "small language models"
     final_state = run_research(topic_arg)
     print(final_state.get("final_report", "(no report produced)"))

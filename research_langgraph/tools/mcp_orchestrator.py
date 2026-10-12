@@ -37,7 +37,8 @@ def auth_context() -> dict:
 def _post(url: str, payload: dict) -> dict:
     import httpx  # lazy import: only needed when a Dockerized MCP server is configured
 
-    resp = httpx.post(url, json=payload, timeout=_HTTP_TIMEOUT)
+    headers = {"X-Service-Token": os.environ["TOOL_SERVICE_TOKEN"]} if os.environ.get("TOOL_SERVICE_TOKEN") else {}
+    resp = httpx.post(url, json=payload, timeout=_HTTP_TIMEOUT, headers=headers)
     resp.raise_for_status()
     return resp.json()
 

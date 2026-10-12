@@ -18,6 +18,8 @@ DEGRADED rejection means "never genuinely evaluated," not "evaluated and found w
 
 from __future__ import annotations
 
+import re
+
 from research_langgraph.observability.execution_quality import compute_execution_quality
 from research_langgraph.routing.model_router import call_structured, fallback_history_entries
 from research_langgraph.schemas.validated_outputs import (
@@ -75,6 +77,26 @@ def _mock_critic(evidence_report: dict) -> CriticOutput:
     )
 
 
+_URL_RE = re.compile(r"(?:https?|ftp|file)://", re.I)
+_MAX_TARGET_CHARS = 200
+
+
+def _sanitize_directives(directives: list, dimensions: list) -> list:
+    """Critic targets become search queries / prompt text, so they derive (indirectly) from
+    scraped content. Drop any that carry a URL, cap their length, and require
+    research_dimension targets to name a real Planner dimension."""
+    clean = []
+    for d in directives:
+        target = (d.target or "").strip()
+        if _URL_RE.search(target):
+            continue
+        if d.action == ReRunAction.research_dimension and target not in dimensions:
+            continue
+        d.target = target[:_MAX_TARGET_CHARS]
+        clean.append(d)
+    return clean
+
+
 def critic_agent(state: dict) -> dict:
     execution_quality = compute_execution_quality(state)
 
@@ -102,6 +124,19 @@ def critic_agent(state: dict) -> dict:
         mock_fn=lambda: _mock_critic(evidence_report),
         budget_mode=budget_mode,
     )
+    if not parsed.approved:
+        safe = _sanitize_directives(parsed.directives, state.get("dimensions", []))
+        if safe:
+            parsed.directives = safe
+        else:  # every directive was invalid/unsafe -> use the deterministic threshold rules
+            parsed = _mock_critic(evidence_report)
+    # The quality status above was computed BEFORE this call; if the Critic itself fell
+    # back to a mock verdict, don't report a clean FULL run.
+    if result.used_mock and execution_quality["status"] == "FULL":
+        execution_quality = {
+            "status": "PARTIAL",
+            "reason": list(execution_quality.get("reason", [])) + ["Critic used a mock fallback"],
+        }
     # mode="json" — action is a ReRunAction (str) Enum; without this, LangGraph's
     # checkpointer serializer stores a raw enum instance instead of a plain string, which
     # it now warns is deprecated and "will be blocked in a future version."

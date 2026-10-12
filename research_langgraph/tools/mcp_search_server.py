@@ -11,16 +11,27 @@ from __future__ import annotations
 
 from typing import List
 
-from fastapi import FastAPI
-from pydantic import BaseModel
+import hmac
+import os
+
+from fastapi import Depends, FastAPI, Header, HTTPException
+from pydantic import BaseModel, Field
 
 from research_langgraph.tools import mcp_search_adapter
 
 app = FastAPI(title="MCP Search Server")
 
 
+def _require_service_token(x_service_token: str = Header(default="")) -> None:
+    """Shared secret between the API and this tool service. Unset = open (local dev);
+    docker-compose makes TOOL_SERVICE_TOKEN mandatory."""
+    expected = os.environ.get("TOOL_SERVICE_TOKEN", "")
+    if expected and not hmac.compare_digest(x_service_token.encode(), expected.encode()):
+        raise HTTPException(status_code=401, detail="invalid service token")
+
+
 class SearchRequest(BaseModel):
-    queries: List[str]
+    queries: List[str] = Field(max_length=50)
 
 
 @app.get("/health")
@@ -28,7 +39,7 @@ def health() -> dict:
     return {"status": "ok", "adapter": mcp_search_adapter.ADAPTER_NAME}
 
 
-@app.post("/search")
+@app.post("/search", dependencies=[Depends(_require_service_token)])
 def search(req: SearchRequest) -> dict:
     sources, events = mcp_search_adapter.search(req.queries)
     return {"sources": sources, "events": events}

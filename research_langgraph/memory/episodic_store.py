@@ -14,14 +14,18 @@ infrastructure for local development.
 from __future__ import annotations
 
 import hashlib
+import logging
 import json
 import os
 import re
 from pathlib import Path
 from typing import List
 
+from research_langgraph.routing.api_keys import KeyPool
+
 _LOCAL_STORE_PATH = Path(os.environ.get("EPISODIC_STORE_PATH", ".episodic_store.json"))
 _EMBED_DIM = 256
+logger = logging.getLogger(__name__)
 
 
 def _hash_embed(text: str) -> List[float]:
@@ -40,24 +44,49 @@ def _cosine(a: List[float], b: List[float]) -> float:
     return sum(x * y for x, y in zip(a, b))
 
 
+_embed_pool = KeyPool()
+
+
 def _embed(text: str) -> List[float]:
     provider = os.environ.get("EMBEDDING_PROVIDER", "").lower()
     if provider == "gemini":
         try:
-            import google.generativeai as genai
+            from google import genai
+            from google.genai import errors as genai_errors
+            from google.genai import types as genai_types
 
-            genai.configure(api_key=os.environ["GOOGLE_API_KEY"])
-            resp = genai.embed_content(model="models/text-embedding-004", content=text)
-            return resp["embedding"]
-        except Exception:
-            pass  # self-heal to the offline embedding rather than fail the store
+            from research_langgraph.routing.api_keys import call_with_failover, parse_keys
+            from research_langgraph.routing.model_tiers import EMBEDDING_BINDING
+
+            def attempt(key: str) -> List[float]:
+                resp = genai.Client(api_key=key).models.embed_content(
+                    model=EMBEDDING_BINDING["model"],
+                    contents=text,
+                    config=genai_types.EmbedContentConfig(output_dimensionality=_EMBED_DIM),
+                )
+                vec = list(resp.embeddings[0].values)
+                norm = sum(v * v for v in vec) ** 0.5 or 1.0  # truncated dims aren't unit-length
+                return [v / norm for v in vec]
+
+            def classify(e: Exception):
+                code = getattr(e, "code", None) if isinstance(e, genai_errors.APIError) else None
+                return 60.0 if code in (429, 401, 403) else None
+
+            return call_with_failover(
+                _embed_pool, parse_keys("GOOGLE_API_KEY", "GEMINI_API_KEY"), attempt, classify, "gemini"
+            )
+        except Exception as e:
+            # self-heal to the offline embedding rather than fail the store, but say so:
+            # hash vectors and Gemini vectors are not comparable with each other.
+            logger.warning("Gemini embedding failed (%s); using offline hash embedding", e)
     return _hash_embed(text)
 
 
 class _LocalStore:
     def __init__(self, path: Path):
         self.path = path
-        self._records = json.loads(path.read_text()) if path.exists() else []
+        text = path.read_text().strip() if path.exists() else ""
+        self._records = json.loads(text) if text else []
 
     def upsert(self, record: dict) -> None:
         self._records = [r for r in self._records if r["run_id"] != record["run_id"]]
@@ -75,7 +104,7 @@ class _QdrantStore:
         from qdrant_client import QdrantClient
         from qdrant_client.models import Distance, VectorParams
 
-        self.client = QdrantClient(url=url)
+        self.client = QdrantClient(url=url, api_key=os.environ.get("QDRANT_API_KEY") or None)
         self.collection = collection
         if not self.client.collection_exists(collection):
             self.client.create_collection(
@@ -91,7 +120,7 @@ class _QdrantStore:
         )
 
     def search(self, embedding: List[float], top_k: int) -> List[dict]:
-        hits = self.client.search(self.collection, query_vector=embedding, limit=top_k)
+        hits = self.client.query_points(self.collection, query=embedding, limit=top_k).points
         return [h.payload for h in hits]
 
 

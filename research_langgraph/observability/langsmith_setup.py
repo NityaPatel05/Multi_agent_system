@@ -17,6 +17,10 @@ def configure_langsmith(project: str = "research-langgraph") -> bool:
     api_key = os.environ.get("LANGSMITH_API_KEY") or os.environ.get("LANGCHAIN_API_KEY")
     if not api_key:
         return False
+    # current LANGSMITH_* names, plus the legacy LANGCHAIN_* ones for older langsmith/langchain
+    os.environ.setdefault("LANGSMITH_TRACING", "true")
+    os.environ.setdefault("LANGSMITH_PROJECT", project)
+    os.environ["LANGSMITH_API_KEY"] = api_key
     os.environ.setdefault("LANGCHAIN_TRACING_V2", "true")
     os.environ.setdefault("LANGCHAIN_PROJECT", project)
     os.environ["LANGCHAIN_API_KEY"] = api_key
